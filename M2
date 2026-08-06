@@ -3274,6 +3274,10 @@ local function install()
 		VeinStatsLabel = VeinBox:AddLabel("Tracking: 0  |  Shown: 0")
 	end
 
+	-- Call both installation functions to render them on the UI
+	install()
+	installVein()
+
 
 	install()
 end
