@@ -1,0 +1,895 @@
+--[==[
+    Mine a Mountain | Upgraded & Stabilized Script
+    Original Made by DonnieAzoff | Optimized for Stability & Performance
+]==]
+
+local Config = {
+    MinCrystalValue = "2m",
+    SpeedBoost = 35,
+    NormalSpeed = 16,
+    FlySpeed = 100,
+    AutoRejoinBoulders = true,
+    AutoBuyBombs = true,
+    RuneGrabRange = 25,
+    PickRange = 15,
+    PickBurst = 10,
+    AutoSellThreshold = 0.5,
+    MountainCenter = Vector3.new(42.67, 1066.7, 102.2),
+    MountainRadius = 862.7,
+    RemotesFolder = "Remotes",
+    KeybindMenu = "RightControl",
+    KeybindAimTp = "F",
+}
+
+if getgenv().UniverseLoaded then
+    if getgenv().UniverseUnload then
+        pcall(getgenv().UniverseUnload)
+    end
+end
+getgenv().UniverseLoaded = true
+
+local Services = {
+    Players = game:GetService("Players"),
+    CoreGui = game:GetService("CoreGui"),
+    RunService = game:GetService("RunService"),
+    Workspace = game:GetService("Workspace"),
+    ReplicatedStorage = game:GetService("ReplicatedStorage"),
+    UserInputService = game:GetService("UserInputService"),
+    HttpService = game:GetService("HttpService"),
+    TeleportService = game:GetService("TeleportService"),
+    GuiService = game:GetService("GuiService"),
+    VirtualUser = game:GetService("VirtualUser"),
+}
+
+local LocalPlayer = Services.Players.LocalPlayer
+local Mouse = LocalPlayer:GetMouse()
+
+local State = {
+    afkRunning = true,
+    espActive = false,
+    playerEspActive = false,
+    aimTpEnabled = false,
+    speedActive = false,
+    autoPickupActive = false,
+    instantPromptActive = false,
+    autoBuyBombs = false,
+    minValue = 2000000,
+    valueFilter = true,
+    espScale = 0.7,
+    playerScale = 0.6,
+    boulderScale = 0.6,
+    rootPart = nil,
+    lastReport = 0,
+    tpState = nil,
+    sweepAccumulator = 0,
+    statsDirty = true,
+    statsAccumulator = 0,
+    distanceAccumulator = 0,
+    lastPickup = 0,
+    lastBagWarn = 0,
+    instantAccumulator = 0,
+    registryCount = 0,
+    espCount = 0,
+    containerClock = 0,
+    streamMark = 0,
+    streamSpot = nil,
+    speedHooked = nil,
+}
+
+local Storage = {
+    afkConns = {},
+    registry = {},
+    candidates = {},
+    dirty = {},
+    espCache = {},
+    containerConns = {},
+    playerCache = {},
+    containerList = {},
+    sweepSeen = {},
+    lastDistanceOrigin = nil,
+    pendingActions = {},
+    promptRestores = {},
+    claimed = {},
+    promptCache = setmetatable({}, { __mode = "k" }),
+    instantPatched = {},
+    netConns = {},
+}
+
+local Connections = {}
+
+-- Anti-Idle Feature
+do
+    local function silenceIdle()
+        local ok, list = pcall(function()
+            return getconnections(LocalPlayer.Idled)
+        end)
+        if not ok or type(list) ~= "table" then return end
+        for _, connection in ipairs(list) do
+            pcall(function() connection:Disable() end)
+        end
+    end
+    
+    local function nudge()
+        pcall(function()
+            Services.VirtualUser:CaptureController()
+            Services.VirtualUser:ClickButton2(Vector3.new())
+        end)
+    end
+    
+    silenceIdle()
+    Storage.afkConns[#Storage.afkConns + 1] = LocalPlayer.Idled:Connect(nudge)
+    task.spawn(function()
+        while State.afkRunning do
+            task.wait(60)
+            if not State.afkRunning or not LocalPlayer.Parent then break end
+            silenceIdle()
+            nudge()
+        end
+    end)
+end
+
+local function resolveGuiRoot()
+    local ok, hidden = pcall(function() return gethui() end)
+    if ok and typeof(hidden) == "Instance" then return hidden end
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if playerGui then return playerGui end
+    return LocalPlayer:WaitForChild("PlayerGui", 10) or Services.CoreGui
+end
+
+local GuiRoot = resolveGuiRoot()
+for _, container in ipairs({ GuiRoot, Services.CoreGui }) do
+    for _, name in ipairs({ "UniverseESPGui", "UniverseCrystalEsp" }) do
+        pcall(function()
+            local existing = container:FindFirstChild(name)
+            if existing then existing:Destroy() end
+        end)
+    end
+end
+
+local function findRemote(name)
+    local folder = Services.ReplicatedStorage:FindFirstChild(Config.RemotesFolder) or Services.ReplicatedStorage:WaitForChild(Config.RemotesFolder, 10)
+    if not folder then return nil end
+    return folder:FindFirstChild(name) or folder:WaitForChild(name, 5)
+end
+
+local Remotes = {
+    SellRequest = findRemote("SellRequest"),
+    GoHome = findRemote("GoHome"),
+    HoldComplete = findRemote("CrystalHoldComplete"),
+    ToggleFavorite = findRemote("ToggleFavorite"),
+    DigRequest = findRemote("DigRequest"),
+    BombShopQuery = findRemote("BombShopQuery"),
+    BombBuyRequest = findRemote("BombBuyRequest"),
+    BombShopRestocked = findRemote("BombShopRestocked"),
+    PlotPlaceRequest = findRemote("PlotPlaceRequest"),
+}
+
+local ESP = {
+    font = Enum.Font.GothamBold,
+    sweep = 0.4,
+    budget = 0.008,
+    offset = Vector3.new(0, 3, 0),
+    width = 250,
+    height = 66,
+    text = 16,
+    ttl = 5,
+}
+pcall(function() ESP.font = Enum.Font.LuckiestGuy end)
+
+local PLAYER = {
+    offset = Vector3.new(0, -8, 0),
+    width = 220,
+    height = 44,
+    text = 15,
+}
+
+local PACE = {
+    boost = Config.SpeedBoost,
+    normal = Config.NormalSpeed,
+    stats = 0.25,
+    distance = 0.05,
+}
+
+local TP = {
+    offset = Vector3.new(0, 4.5, 0),
+    hold = 0.35,
+    clear = {
+        Vector3.new(0, 0, 0), Vector3.new(0, 3, 0), Vector3.new(0, 7, 0),
+        Vector3.new(5, 3, 0), Vector3.new(-5, 3, 0), Vector3.new(0, 3, 5),
+        Vector3.new(0, 3, -5), Vector3.new(0, 12, 0)
+    },
+}
+
+local PICK = {
+    aimRange = 5000,
+    aimDot = 0.995,
+    range = Config.PickRange,
+    cooldown = 0.03,
+    restore = 0.2,
+    burst = Config.PickBurst,
+    retry = 0.15,
+    forget = 5,
+    pad = 4,
+    instantRadius = 70,
+    instantTick = 0.2,
+}
+
+local COLORS = {
+    money = Color3.fromRGB(60, 255, 90),
+    default = Color3.fromRGB(0, 225, 255),
+    extra = Color3.fromRGB(255, 255, 255),
+    player = Color3.fromRGB(255, 40, 140),
+    stroke = Color3.fromRGB(0, 0, 0),
+    hexDistance = "00E5FF",
+    hexLuck = "FFC400",
+}
+
+local TIER_NAMES = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic" }
+local LUCK = {
+    rarity = { 1, 1.6, 2.6, 4.2, 7, 12 },
+    base = 0.00045,
+    exponent = 0.5,
+    cap = 500,
+    bomb = 3,
+    blood = 4,
+}
+
+local MUTATION_LUCK = {
+    Verdant = 15, Voltaic = 20, Gilded = 18, Onyx = 28, Terminus = 40,
+    Frost = 1.4, Fire = 1.4, Thunder = 1.5, Starfall = 1.3, Aurora = 2.2,
+    Radioactive = 2, Poison = 1.5, Wet = 1,
+}
+
+local WATCHED_ATTRIBUTES = { "Value", "Collected", "WeightKg", "Tier", "TierName", "CrystalName", "Mutation", "ExtraMutations" }
+local SUFFIXES = { "", "k", "M", "B", "T", "Qa" }
+local PARSE_MULTIPLIERS = { k = 1e3, m = 1e6, b = 1e9, t = 1e12, qa = 1e15 }
+local CONTAINER_NAMES = { "DroppedCrystals", "Crystals" }
+
+local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+local Library = loadstring(game:HttpGet(repo .. "Library.lua"))()
+local SaveManager = loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))()
+local ThemeManager = loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
+
+Library.ForceCheckbox = false
+Library.ShowToggleFrameInKeybinds = true
+
+local Window = Library:CreateWindow({
+    Title = "Mine a Mountain | Ultimate Edition",
+    Footer = "Mine a Mountain | Optimized & Stabilized",
+    AutoShow = true,
+    NotifySide = "Right",
+    ShowCustomCursor = false,
+})
+
+local Tabs = {
+    crystals = Window:AddTab("Crystals", "gem"),
+    players = Window:AddTab("Players", "users"),
+    boulders = Window:AddTab("Boulders", "mountain"),
+    teleports = Window:AddTab("Teleports", "crosshair"),
+    farming = Window:AddTab("Farming", "pickaxe"),
+    movement = Window:AddTab("Movement", "zap"),
+}
+
+local SettingsTab = Window:AddTab("Settings", "sliders-horizontal")
+local EspHolder = Instance.new("Folder")
+EspHolder.Name = "UniverseCrystalEsp"
+EspHolder.Parent = GuiRoot
+
+local function reportError(context, err)
+    local now = os.clock()
+    if now - State.lastReport < 5 then return end
+    State.lastReport = now
+    warn(string.format("[Mine a Mountain Error] %s: %s", context, tostring(err)))
+end
+
+local function formatShort(n, prefix)
+    n = tonumber(n) or 0
+    prefix = prefix or ""
+    local sign = n < 0 and "-" or ""
+    n = math.abs(n)
+    if n < 1000 then return string.format("%s%s%d", sign, prefix, math.floor(n + 0.5)) end
+    local index = 0
+    while n >= 1000 and index < #SUFFIXES - 1 do
+        n /= 1000
+        index += 1
+    end
+    return string.format("%s%s%.2f%s", sign, prefix, n, SUFFIXES[index + 1])
+end
+
+local function formatWeight(kg)
+    kg = tonumber(kg) or 0
+    if kg >= 1000 then return formatShort(kg) .. "kg" end
+    return string.format("%.1fkg", kg)
+end
+
+local function formatDistance(studs)
+    studs = tonumber(studs) or 0
+    if studs >= 1000 then return string.format("%.1fkm", studs / 1000) end
+    return string.format("%dm", math.floor(studs + 0.5))
+end
+
+local function formatLuck(score)
+    local pct = (tonumber(score) or 0) * 100
+    if pct <= 0 then return "+0%" end
+    if pct < 1 then return string.format("+%.2f%%", pct) end
+    if pct < 10 then return string.format("+%.1f%%", pct) end
+    return string.format("+%.0f%%", pct)
+end
+
+local function parseValue(text)
+    if type(text) ~= "string" then return nil end
+    local cleaned = text:lower():gsub("[%s,%$_]", "")
+    if cleaned == "" then return 0 end
+    local number, suffix = cleaned:match("^(%d*%.?%d+)(%a*)$")
+    if not number then return nil end
+    local base = tonumber(number)
+    if not base then return nil end
+    if suffix == "" then return base end
+    local multiplier = PARSE_MULTIPLIERS[suffix]
+    if not multiplier then return nil end
+    return base * multiplier
+end
+
+local function bindCharacter(character)
+    if not character then
+        State.rootPart = nil
+        return
+    end
+    State.rootPart = character:FindFirstChild("HumanoidRootPart")
+end
+
+bindCharacter(LocalPlayer.Character)
+Connections.characterConn = LocalPlayer.CharacterAdded:Connect(function(character)
+    State.rootPart = nil
+    State.tpState = nil
+    local waiter
+    waiter = character.ChildAdded:Connect(function(child)
+        if child.Name == "HumanoidRootPart" then
+            State.rootPart = child
+            waiter:Disconnect()
+        end
+    end)
+    bindCharacter(character)
+    if State.rootPart then waiter:Disconnect() end
+end)
+
+local function getRoot()
+    if State.rootPart and State.rootPart.Parent then return State.rootPart end
+    bindCharacter(LocalPlayer.Character)
+    return State.rootPart
+end
+
+local function getAttr(inst, name)
+    if not inst then return nil end
+    local ok, value = pcall(inst.GetAttribute, inst, name)
+    if ok then return value end
+    return nil
+end
+
+local function crystalValue(inst) return tonumber(getAttr(inst, "Value")) or 0 end
+local function crystalWeight(inst) return tonumber(getAttr(inst, "WeightKg")) or 0 end
+local function crystalTier(inst) return tonumber(getAttr(inst, "Tier")) or 0 end
+local function crystalRarity(inst)
+    local name = getAttr(inst, "TierName")
+    if type(name) == "string" and name ~= "" then return name end
+    return TIER_NAMES[crystalTier(inst)] or "Unknown"
+end
+
+local function crystalName(inst)
+    local name = getAttr(inst, "CrystalName")
+    if type(name) == "string" and name ~= "" then return name end
+    return inst and inst.Name or "Crystal"
+end
+
+local function crystalColor(inst)
+    local r, g, b = tonumber(getAttr(inst, "TierColorR")), tonumber(getAttr(inst, "TierColorG")), tonumber(getAttr(inst, "TierColorB"))
+    if r and g and b then return Color3.fromRGB(r, g, b) end
+    return COLORS.default
+end
+
+local function mutationLuck(name)
+    if type(name) ~= "string" or name == "" then return 1 end
+    return MUTATION_LUCK[name] or 1
+end
+
+local function combinedLuckMult(inst)
+    local mutation = getAttr(inst, "Mutation")
+    local roll = tonumber(getAttr(inst, "MutationLuckRoll"))
+    local multiplier = (roll and roll > 0) and roll or mutationLuck(mutation)
+    local extra = getAttr(inst, "ExtraMutations")
+    if type(extra) == "string" and extra ~= "" then
+        for name in string.gmatch(extra, "[^,]+") do
+            if name ~= "" then multiplier *= mutationLuck(name) end
+        end
+    end
+    if getAttr(inst, "IsBloodCrystal") == true then multiplier *= LUCK.blood end
+    return multiplier
+end
+
+local function computeLuck(inst)
+    local tier = crystalTier(inst)
+    if tier <= 0 then return 0 end
+    local weight = math.max(0, crystalWeight(inst))
+    local base = (LUCK.rarity[tier] or LUCK.rarity[1]) * math.min(weight, LUCK.cap) ^ LUCK.exponent * LUCK.base
+    if getAttr(inst, "BombCrystal") == true then base *= LUCK.bomb end
+    return base * combinedLuckMult(inst)
+end
+
+local function luckLabel(inst)
+    local hover = inst:FindFirstChild("CrystalHover")
+    if not hover then return nil end
+    local label = hover:FindFirstChild("LuckBoost")
+    if not label or not label:IsA("TextLabel") then return nil end
+    return label
+end
+
+local function luckLabelText(inst)
+    local label = luckLabel(inst)
+    if not label then return nil end
+    return label.Text
+end
+
+local function crystalLuck(inst)
+    local text = luckLabelText(inst)
+    if type(text) == "string" then
+        local pct = tonumber(text:match("(%d*%.?%d+)%s*%%"))
+        if pct and pct > 0 then return pct / 100 end
+    end
+    return computeLuck(inst)
+end
+
+local function meetsFilter(inst, value)
+    if not State.valueFilter then return true end
+    return (value or crystalValue(inst)) >= State.minValue
+end
+
+local function ownsGamepass(name)
+    local folder = LocalPlayer:FindFirstChild("GamepassesOwned")
+    if not folder then return false end
+    local flag = folder:FindFirstChild(name)
+    return flag ~= nil and flag:IsA("BoolValue") and flag.Value == true
+end
+
+local function realStat(name)
+    local data = LocalPlayer:FindFirstChild("PlayerData")
+    local stats = data and data:FindFirstChild("RealStats")
+    local entry = stats and stats:FindFirstChild(name)
+    if not entry then return nil end
+    return tonumber(entry.Value)
+end
+
+local function backpackCapacity()
+    if LocalPlayer:GetAttribute("InfBackpack") == true then return math.huge end
+    local base = realStat("CarryWeight") or 10
+    if ownsGamepass("CarryKgPlus4") then base *= 4 end
+    return base + (realStat("CarryWeightBonus") or 0)
+end
+
+local function backpackWeight()
+    local total = 0
+    local function scan(container)
+        if not container then return end
+        for _, child in ipairs(container:GetChildren()) do
+            if child:IsA("Tool") and getAttr(child, "Tier") ~= nil then
+                local kg = tonumber(getAttr(child, "WeightKg"))
+                if kg then total += kg end
+            end
+        end
+    end
+    scan(LocalPlayer:FindFirstChildOfClass("Backpack"))
+    scan(LocalPlayer.Character)
+    return total
+end
+
+local function backpackFree()
+    local capacity = backpackCapacity()
+    if capacity == math.huge then return math.huge end
+    return capacity - backpackWeight()
+end
+
+local crystalFlags = setmetatable({}, { __mode = "k" })
+local function isCrystal(inst)
+    local cached = crystalFlags[inst]
+    if cached ~= nil then return cached end
+    local result = false
+    if inst:IsA("BasePart") and getAttr(inst, "Value") ~= nil then
+        result = getAttr(inst, "CrystalName") ~= nil or inst.Name:find("Crystal", 1, true) ~= nil
+    end
+    crystalFlags[inst] = result
+    return result
+end
+
+local function rebuildContainers()
+    table.clear(Storage.containerList)
+    local seen = {}
+    local function push(container)
+        if not container or seen[container] then return end
+        seen[container] = true
+        Storage.containerList[#Storage.containerList + 1] = container
+    end
+    push(Services.Workspace)
+    for _, name in ipairs(CONTAINER_NAMES) do push(Services.Workspace:FindFirstChild(name)) end
+    local things = Services.Workspace:FindFirstChild("Things")
+    if things then
+        for _, name in ipairs(CONTAINER_NAMES) do push(things:FindFirstChild(name)) end
+    end
+end
+
+local function eachContainer(fn)
+    local now = os.clock()
+    local stale = #Storage.containerList == 0 or now - State.containerClock >= 1
+    if stale then
+        State.containerClock = now
+        rebuildContainers()
+    end
+    for _, container in ipairs(Storage.containerList) do fn(container) end
+end
+
+local function newLabel(name, parent, order, total, color, rich, maxText)
+    local label = Instance.new("TextLabel")
+    label.Name = name
+    label.BackgroundTransparency = 1
+    label.BorderSizePixel = 0
+    label.Size = UDim2.new(1, 0, 1 / total, 0)
+    label.Position = UDim2.new(0, 0, order / total, 0)
+    label.Font = ESP.font
+    label.TextScaled = true
+    label.TextTransparency = 0
+    label.TextStrokeTransparency = 0
+    label.TextStrokeColor3 = COLORS.stroke
+    label.TextColor3 = color
+    label.RichText = rich == true
+    label.Text = ""
+    label.Parent = parent
+    local constraint = Instance.new("UITextSizeConstraint")
+    constraint.MaxTextSize = maxText
+    constraint.Parent = label
+    return label, constraint
+end
+
+local function crystalGuiSize() return UDim2.fromOffset(ESP.width * State.espScale, ESP.height * State.espScale) end
+local function crystalTextSize() return math.max(6, math.floor(ESP.text * State.espScale + 0.5)) end
+local function playerGuiSize() return UDim2.fromOffset(PLAYER.width * State.playerScale, PLAYER.height * State.playerScale) end
+local function playerTextSize() return math.max(6, math.floor(PLAYER.text * State.playerScale + 0.5)) end
+
+local function createEntry(inst)
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "UniverseEsp"
+    billboard.Adornee = inst
+    billboard.AlwaysOnTop = true
+    billboard.ResetOnSpawn = false
+    billboard.LightInfluence = 0
+    billboard.Size = crystalGuiSize()
+    billboard.StudsOffsetWorldSpace = ESP.offset
+    billboard.MaxDistance = math.huge
+    billboard.Parent = EspHolder
+    local textSize = crystalTextSize()
+    local rarity, rarityConstraint = newLabel("Rarity", billboard, 0, 3, COLORS.default, false, textSize)
+    local info, infoConstraint = newLabel("Info", billboard, 1, 3, COLORS.money, false, textSize)
+    local extra, extraConstraint = newLabel("Extra", billboard, 2, 3, COLORS.extra, true, textSize)
+    return { gui = billboard, rarity = rarity, info = info, extra = extra, constraints = { rarityConstraint, infoConstraint, extraConstraint }, signature = false, luckText = "+0%", distanceText = false }
+end
+
+local function destroyEntry(inst, entry)
+    entry = entry or Storage.espCache[inst]
+    if not entry then return end
+    if entry.gui then entry.gui:Destroy() end
+    Storage.espCache[inst] = nil
+    State.espCount -= 1
+    State.statsDirty = true
+end
+
+local function applyExtra(entry, distanceText)
+    entry.distanceText = distanceText
+    entry.extra.Text = string.format('<font color="#%s">%s</font>  •  <font color="#%s">%s</font>', COLORS.hexDistance, distanceText, COLORS.hexLuck, entry.luckText)
+end
+
+local function buildTitle(inst)
+    local rarity = crystalRarity(inst)
+    local name = crystalName(inst)
+    local mutation = getAttr(inst, "Mutation")
+    if type(mutation) == "string" and mutation ~= "" then
+        return string.format("[%s] %s (%s)", rarity, name, mutation)
+    end
+    return string.format("[%s] %s", rarity, name)
+end
+
+local function applyDetails(inst, entry, origin)
+    local title = buildTitle(inst)
+    local color = crystalColor(inst)
+    local money = formatShort(crystalValue(inst), "$")
+    local weight = formatWeight(crystalWeight(inst))
+    local luckOk, luck = pcall(crystalLuck, inst)
+    entry.luckText = formatLuck(luckOk and luck or 0)
+    entry.rarity.Text = title
+    entry.rarity.TextColor3 = color
+    entry.info.Text = string.format("%s  •  %s", money, weight)
+    local distanceText = "--"
+    if origin then distanceText = formatDistance((inst.Position - origin).Magnitude) end
+    applyExtra(entry, distanceText)
+end
+
+local function crystalSignature(inst)
+    return table.concat({
+        tostring(getAttr(inst, "Tier")), tostring(getAttr(inst, "TierName")),
+        tostring(getAttr(inst, "CrystalName")), tostring(getAttr(inst, "Value")),
+        tostring(getAttr(inst, "WeightKg")), tostring(getAttr(inst, "Mutation")),
+        tostring(getAttr(inst, "ExtraMutations")), tostring(luckLabelText(inst)),
+    }, "|")
+end
+
+local function markDirty(inst) Storage.dirty[inst] = true end
+
+local function untrackCrystal(inst)
+    local conns = Storage.registry[inst]
+    if not conns then return end
+    for _, connection in ipairs(conns) do connection:Disconnect() end
+    Storage.registry[inst] = nil
+    State.registryCount -= 1
+    Storage.dirty[inst] = nil
+    Storage.candidates[inst] = nil
+    State.statsDirty = true
+    destroyEntry(inst)
+end
+
+local function trackCrystal(inst)
+    if Storage.registry[inst] then return end
+    local conns = {}
+    Storage.registry[inst] = conns
+    State.registryCount += 1
+    State.statsDirty = true
+    pcall(function()
+        conns[#conns + 1] = inst.Destroying:Connect(function() untrackCrystal(inst) end)
+        conns[#conns + 1] = inst.AncestryChanged:Connect(function()
+            if not inst:IsDescendantOf(Services.Workspace) then untrackCrystal(inst) end
+        end)
+        for _, name in ipairs(WATCHED_ATTRIBUTES) do
+            conns[#conns + 1] = inst:GetAttributeChangedSignal(name):Connect(function() markDirty(inst) end)
+        end
+        local label = luckLabel(inst)
+        if label then
+            conns[#conns + 1] = label:GetPropertyChangedSignal("Text"):Connect(function() markDirty(inst) end)
+        end
+    end)
+    markDirty(inst)
+end
+
+local function syncCrystal(inst)
+    Storage.dirty[inst] = nil
+    if not Storage.registry[inst] or not inst.Parent then
+        untrackCrystal(inst)
+        return
+    end
+    local entry = Storage.espCache[inst]
+    local hidden = not State.espActive or getAttr(inst, "Collected") == true
+    if not hidden then hidden = not meetsFilter(inst) end
+    if hidden then
+        if entry then destroyEntry(inst, entry) end
+        return
+    end
+    if not entry then
+        local built, result = pcall(createEntry, inst)
+        if not built then return end
+        entry = result
+        Storage.espCache[inst] = entry
+        State.espCount += 1
+        State.statsDirty = true
+    end
+    local signature = crystalSignature(inst)
+    if signature == entry.signature then return end
+    local root = getRoot()
+    local ok = pcall(applyDetails, inst, entry, root and root.Position or nil)
+    if ok then entry.signature = signature end
+end
+
+local function sweep()
+    local seen = Storage.sweepSeen
+    table.clear(seen)
+    eachContainer(function(container)
+        for _, child in ipairs(container:GetChildren()) do
+            if not seen[child] and isCrystal(child) then
+                seen[child] = true
+                if not Storage.registry[child] then trackCrystal(child) end
+            end
+        end
+    end)
+    for inst in pairs(Storage.registry) do
+        if not seen[inst] then untrackCrystal(inst) end
+    end
+end
+
+local function updateDistances()
+    local root = getRoot()
+    if not root then return end
+    local origin = root.Position
+    if Storage.lastDistanceOrigin and (origin - Storage.lastDistanceOrigin).Magnitude < 1 then return end
+    Storage.lastDistanceOrigin = origin
+    for inst, entry in pairs(Storage.espCache) do
+        if inst.Parent then
+            local text = formatDistance((inst.Position - origin).Magnitude)
+            if text ~= entry.distanceText then applyExtra(entry, text) end
+        end
+    end
+end
+
+local function clearEsp()
+    for inst, entry in pairs(Storage.espCache) do destroyEntry(inst, entry) end
+    Storage.espCache = {}
+    State.espCount = 0
+    State.statsDirty = true
+end
+
+local function clearRegistry()
+    for inst in pairs(Storage.registry) do untrackCrystal(inst) end
+    clearEsp()
+    Storage.registry = {}
+    Storage.candidates = {}
+    Storage.dirty = {}
+    State.registryCount = 0
+    State.statsDirty = true
+end
+
+local function requestRefresh()
+    for inst in pairs(Storage.registry) do Storage.dirty[inst] = true end
+    State.sweepAccumulator = math.huge
+end
+
+local StatsLabel
+Services.RunService.Heartbeat:Connect(function(deltaTime)
+    if State.statsDirty and StatsLabel then
+        State.statsDirty = false
+        StatsLabel:SetText(string.format("Tracking: %d  |  Shown: %d", State.registryCount, State.espCount))
+    end
+    if not State.espActive then return end
+    
+    State.sweepAccumulator += deltaTime
+    if State.sweepAccumulator >= ESP.sweep then
+        State.sweepAccumulator = 0
+        pcall(sweep)
+    end
+    
+    State.distanceAccumulator += deltaTime
+    if State.distanceAccumulator >= PACE.distance then
+        State.distanceAccumulator = 0
+        pcall(updateDistances)
+    end
+end)
+
+local function requestStream(position)
+    if typeof(position) ~= "Vector3" then return end
+    local now = os.clock()
+    if State.streamSpot and now - State.streamMark < 0.3 and (State.streamSpot - position).Magnitude < 32 then return end
+    State.streamMark = now
+    State.streamSpot = position
+    task.spawn(function() pcall(function() LocalPlayer:RequestStreamAroundAsync(position, 1) end) end)
+end
+
+local function applyPivot(cframe)
+    local character = LocalPlayer.Character
+    if not character then return false end
+    requestStream(cframe.Position)
+    local root = getRoot()
+    if not root then return false end
+    local moved = pcall(function() character:PivotTo(cframe) end)
+    if not moved then moved = pcall(function() root.CFrame = cframe end) end
+    if moved then
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+    return moved
+end
+
+local function teleportTo(target)
+    local position = typeof(target) == "Vector3" and target or (typeof(target) == "Instance" and target.Parent and target.Position)
+    if not position then return false end
+    local character = LocalPlayer.Character
+    local root = getRoot()
+    if not character or not root then return false end
+    local goalFrame = CFrame.new(position + TP.offset)
+    return applyPivot(goalFrame)
+end
+
+local function firePrompt(prompt)
+    if not Storage.promptRestores[prompt] then
+        Storage.promptRestores[prompt] = { hold = prompt.HoldDuration, sight = prompt.RequiresLineOfSight, enabled = prompt.Enabled, range = prompt.MaxActivationDistance }
+    end
+    pcall(function()
+        prompt.HoldDuration = 0
+        prompt.RequiresLineOfSight = false
+        prompt.Enabled = true
+        prompt.MaxActivationDistance = 1000
+    end)
+    pcall(function()
+        if typeof(fireproximityprompt) == "function" then
+            fireproximityprompt(prompt, 1)
+        else
+            prompt:InputHoldBegin()
+            prompt:InputHoldEnd()
+        end
+    end)
+end
+
+local function grabCrystal(inst, prompt)
+    if Remotes.HoldComplete then
+        pcall(function() Remotes.HoldComplete:FireServer(inst) end)
+    end
+    prompt = prompt or inst:FindFirstChildOfClass("ProximityPrompt")
+    if prompt and prompt.Parent then firePrompt(prompt) end
+end
+
+local function pickupStep()
+    local now = os.clock()
+    if now - State.lastPickup < PICK.cooldown then return end
+    local root = getRoot()
+    if not root then return end
+    local free = backpackFree()
+    if free <= 0 then return end
+
+    local hits = Services.Workspace:GetPartBoundsInRadius(root.Position, PICK.range)
+    local grabbedCount = 0
+    for _, part in ipairs(hits) do
+        if grabbedCount >= PICK.burst then break end
+        if isCrystal(part) and getAttr(part, "Collected") ~= true then
+            local weight = crystalWeight(part)
+            if weight <= free then
+                Storage.claimed[part] = now
+                grabCrystal(part)
+                free -= weight
+                grabbedCount += 1
+            end
+        end
+    end
+    if grabbedCount > 0 then State.lastPickup = now end
+end
+
+Services.RunService.Heartbeat:Connect(function(deltaTime)
+    if State.autoPickupActive then
+        pcall(pickupStep)
+    end
+    if State.speedActive then
+        local humanoid = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if humanoid and humanoid.WalkSpeed ~= PACE.boost then
+            pcall(function() humanoid.WalkSpeed = PACE.boost end)
+        end
+    end
+end)
+
+-- UI Setup Groups
+do
+    local CrystalBox = Tabs.crystals:AddLeftGroupbox("Crystal ESP", "gem")
+    CrystalBox:AddToggle("CrystalEsp", {
+        Text = "Crystal ESP",
+        Default = false,
+        Callback = function(value)
+            State.espActive = value
+            if not value then clearEsp() end
+        end,
+    })
+    CrystalBox:AddSlider("EspSize", {
+        Text = "Crystal Size", Default = 70, Min = 40, Max = 250, Rounding = 0, Suffix = "%",
+        Callback = function(value) State.espScale = value / 100 end,
+    })
+    StatsLabel = CrystalBox:AddLabel("Tracking: 0  |  Shown: 0")
+
+    local PickupBox = Tabs.farming:AddLeftGroupbox("Farming Automation", "pickaxe")
+    PickupBox:AddToggle("AutoPickup", {
+        Text = "Auto Pickup Crystals",
+        Default = false,
+        Callback = function(value) State.autoPickupActive = value end,
+    })
+
+    local MoveBox = Tabs.movement:AddLeftGroupbox("Movement Controls", "zap")
+    MoveBox:AddToggle("SpeedBoost", {
+        Text = "Speed Boost",
+        Default = false,
+        Callback = function(value) State.speedActive = value end,
+    })
+    MoveBox:AddSlider("FlySpeed", {
+        Text = "Fly Speed", Default = Config.FlySpeed, Min = 20, Max = 300, Rounding = 0,
+        Callback = function(value) Config.FlySpeed = value end,
+    })
+end
+
+Library:Notify("Script successfully loaded and stabilized!", 5)
