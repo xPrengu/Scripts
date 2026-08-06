@@ -290,15 +290,10 @@ local WATCHED_ATTRIBUTES = {
 	"Mutation",
 	"ExtraMutations",
 }
+
 local SUFFIXES = { "", "k", "M", "B", "T", "Qa" }
 local PARSE_MULTIPLIERS = { k = 1e3, m = 1e6, b = 1e9, t = 1e12, qa = 1e15 }
 local CONTAINER_NAMES = { "DroppedCrystals", "Crystals" }
-
--- Ensure State table exists for settings/variables
-getgenv().State = getgenv().State or {}
-State.lastReport = State.lastReport or 0
-State.TargetMinGemValue = 1000000
-State.MountainFirstMode = true
 
 local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
 local Library = loadstring(game:HttpGet(repo .. "Library.lua"))()
@@ -327,19 +322,9 @@ local Tabs = {
 
 local SettingsTab = Window:AddTab("Settings", "sliders-horizontal")
 
--- Services and LocalPlayer references for features
-local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
-local GuiRoot = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui")
-
 local EspHolder = Instance.new("Folder")
 EspHolder.Name = "UniverseCrystalEsp"
 EspHolder.Parent = GuiRoot
-
-local Services = {
-	Workspace = game:GetService("Workspace"),
-	RunService = game:GetService("RunService"),
-}
 
 local function reportError(context, err)
 	local now = os.clock()
@@ -349,180 +334,6 @@ local function reportError(context, err)
 	State.lastReport = now
 	warn(string.format("[Mine a Mountain] %s: %s", context, tostring(err)))
 end
-
--- Helper functions for value parsing
-local function parseValue(text)
-	text = text:lower():gsub("[$%s,", "")
-	local numberPart, suffix = text:match("([%d%.]+)([%a]*)")
-	local num = tonumber(numberPart)
-	if not num then return nil end
-	local mult = PARSE_MULTIPLIERS[suffix] or 1
-	return num * mult
-end
-
-local function formatShort(val, prefix)
-	prefix = prefix or ""
-	for i = #SUFFIXES, 1, -1 do
-		local pow = 3 * (i - 1)
-		if val >= 10^pow then
-			return string.format("%s%.1f%s", prefix, val / (10^pow), SUFFIXES[i])
-		end
-	end
-	return string.format("%s%d", prefix, val)
-end
-
--- =========================================================================
--- 1. No Fall Damage (Added to Movement Tab)
--- =========================================================================
-do
- local function install()
-  local function setupNoFallDamage(character)
-   local humanoid = character:WaitForChild("Humanoid", 10)
-   if humanoid then
-    pcall(function()
-     humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-     humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
-    end)
-   end
-  end
-  
-  if LocalPlayer.Character then
-   task.spawn(function() setupNoFallDamage(LocalPlayer.Character) end)
-  end
-  LocalPlayer.CharacterAdded:Connect(setupNoFallDamage)
-
-  local MoveBox = Tabs.movement:AddLeftGroupbox("Extra Features", "shield")
-  MoveBox:AddToggle("NoFallDamage", {
-   Text = "No Fall Damage",
-   Default = true,
-   Callback = function(value)
-    local char = LocalPlayer.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if hum then
-     hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, not value)
-     hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, not value)
-    end
-   end,
-  })
- end
- install()
-end
-
--- =========================================================================
--- 2. Vein ESP (Added to Crystals Tab)
--- =========================================================================
-do
- local function install()
-  local veinEspActive = false
-  local veinCache = {}
-  
-  local function isVein(inst)
-   if not inst:IsA("BasePart") then return false end
-   local name = inst.Name:lower()
-   return name:find("vein") ~= nil or name:find("ore") ~= nil or name:find("node") ~= nil
-  end
-
-  local function createVeinEntry(inst)
-   local billboard = Instance.new("BillboardGui")
-   billboard.Name = "UniverseVeinEsp"
-   billboard.Adornee = inst
-   billboard.AlwaysOnTop = true
-   billboard.ResetOnSpawn = false
-   billboard.LightInfluence = 0
-   billboard.Size = UDim2.fromOffset(200, 40)
-   billboard.StudsOffsetWorldSpace = Vector3.new(0, 3, 0)
-   billboard.MaxDistance = math.huge
-   billboard.Parent = EspHolder
-
-   local label = Instance.new("TextLabel")
-   label.Name = "VeinLabel"
-   label.BackgroundTransparency = 1
-   label.Size = UDim2.new(1, 0, 1, 0)
-   label.Font = Enum.Font.GothamBold
-   label.TextSize = 14
-   label.TextColor3 = Color3.fromRGB(255, 170, 0)
-   label.TextStrokeTransparency = 0
-   label.Text = "⚡ Vein: " .. inst.Name
-   label.Parent = billboard
-
-   veinCache[inst] = billboard
-  end
-
-  local function removeVeinEntry(inst)
-   if veinCache[inst] then
-    veinCache[inst]:Destroy()
-    veinCache[inst] = nil
-   end
-  end
-
-  Services.RunService.Heartbeat:Connect(function()
-   if not veinEspActive then return end
-   for _, child in ipairs(Services.Workspace:GetDescendants()) do
-    if isVein(child) then
-     if not veinCache[child] then
-      createVeinEntry(child)
-     end
-    end
-   end
-   for inst, _ in pairs(veinCache) do
-    if not inst.Parent then
-     removeVeinEntry(inst)
-    end
-   end
-  end)
-
-  local CrystalVeinBox = Tabs.crystals:AddRightGroupbox("Vein ESP", "zap")
-  CrystalVeinBox:AddToggle("VeinEsp", {
-   Text = "Vein ESP",
-   Default = false,
-   Callback = function(value)
-    veinEspActive = value
-    if not value then
-     for inst, _ in pairs(veinCache) do
-      removeVeinEntry(inst)
-     end
-    end
-   end,
-  })
- end
- install()
-end
-
--- =========================================================================
--- 3. Targeted Crystal Value & Mountain Mining Logic (Farming Tab)
--- =========================================================================
-do
- local function install()
-  local FarmBox = Tabs.farming:AddRightGroupbox("Targeted Crystal Mining", "crosshair")
-
-  FarmBox:AddInput("TargetGemValueInput", {
-   Text = "Target Gem Value Filter",
-   Default = "1m",
-   Placeholder = "1m, 1b, etc.",
-   Numeric = false,
-   Finished = true,
-   Callback = function(text)
-    local parsed = parseValue(text)
-    if parsed then
-     State.TargetMinGemValue = parsed
-     Library:Notify(string.format("Target Gem Value set to: %s", formatShort(parsed, "$")), 2)
-    end
-   end,
-  })
-
-  FarmBox:AddToggle("MountainFirstMining", {
-   Text = "Mine Mountain First Until Crystal",
-   Default = true,
-   Callback = function(value)
-    State.MountainFirstMode = value
-   end,
-  })
-
-  FarmBox:AddLabel("Strips mountain terrain until a crystal matching your target value appears, then switches focus.", true)
- end
- install()
-end
-
 
 local function formatShort(n, prefix)
 	n = tonumber(n) or 0
@@ -3374,7 +3185,7 @@ do
 end
 
 do
-	local function install()
+local function install()
 		local CrystalBox = Tabs.crystals:AddLeftGroupbox("Crystal ESP", "gem")
 
 		CrystalBox:AddToggle("CrystalEsp", {
@@ -3427,6 +3238,42 @@ do
 
 		StatsLabel = CrystalBox:AddLabel("Tracking: 0  |  Shown: 0")
 	end
+
+	local function installVein()
+		local VeinBox = Tabs.crystals:AddLeftGroupbox("Vein ESP", "mountain")
+
+		VeinBox:AddToggle("VeinEsp", {
+			Text = "Vein ESP",
+			Default = false,
+			Callback = function(value)
+				State.veinEspActive = value
+				if not value then
+					clearVeinEsp()
+				end
+				updateVeinTracking()
+			end,
+		})
+
+		VeinBox:AddSlider("VeinEspSize", {
+			Text = "Vein Size",
+			Default = 70,
+			Min = 40,
+			Max = 250,
+			Rounding = 0,
+			Suffix = "%",
+			Compact = false,
+			Callback = function(value)
+				State.veinEspScale = value / 100
+				applyVeinEspScale()
+			end,
+		})
+
+		VeinBox:AddDivider()
+		VeinBox:AddLabel("Highlights mountain veins for tracking.", true)
+
+		VeinStatsLabel = VeinBox:AddLabel("Tracking: 0  |  Shown: 0")
+	end
+
 
 	install()
 end
@@ -5115,7 +4962,7 @@ end
 local Money = {}
 
 do
-	local function install()
+local function install()
 		local SCAN_SPOTS = {
 			CFrame.new(-12.7105675, 459.090942, 818.847412, 0.993408799, -0.00500036497, -0.11451605, 0.000644713698, 0.999275982, -0.0380407833, 0.114623353, 0.0377162211, 0.992692769),
 			CFrame.new(13.0506754, 318.450409, -488.078888, -0.99998939, 0.000884758658, -0.00452193478, -0.000498382491, 0.954864502, 0.297041386, 0.00458064489, 0.297040492, -0.954853892),
@@ -5265,13 +5112,15 @@ do
 		local sellPhaseClock = 0
 		local plantPhase = "idle"
 		local plantPhaseClock = 0
-		local plantReturnCFrame
+		local plantReturnCField
 		local plantTools = {}
 		local plantIndex = 1
 		local plantPlotPos
 		local plantGroundPos
 		local lootBlocked = false
 		local statusText = "Idle"
+		local onlyExistingGems = false
+		local minMineValue = 0
 
 		local function toggleValue(name)
 			local store = Library and Library.Toggles
@@ -5358,6 +5207,32 @@ do
 			return string.format("%d_%d", math.floor(x / 4), math.floor(z / 4))
 		end
 
+		local function hasExistingCrystalNear(pos)
+			local found = false
+			eachContainer(function(container)
+				for _, child in ipairs(container:GetChildren()) do
+					if child:IsA("BasePart") and isCrystal(child) and getAttr(child, "Collected") ~= true then
+						local val = crystalValue(child)
+						if val >= minMineValue and (child.Position - pos).Magnitude <= 35 then
+							found = true
+							return
+						end
+					elseif child:IsA("Model") then
+						for _, inner in ipairs(child:GetChildren()) do
+							if inner:IsA("BasePart") and isCrystal(inner) and getAttr(inner, "Collected") ~= true then
+								local val = crystalValue(inner)
+								if val >= minMineValue and (inner.Position - pos).Magnitude <= 35 then
+									found = true
+									return
+								end
+							end
+						end
+					end
+				end
+			end)
+			return found
+		end
+
 		local function highestColumn(origin, offsets)
 			local now = os.clock()
 			local best
@@ -5371,8 +5246,12 @@ do
 				if not expire or now > expire then
 					blacklistedColumns[key] = nil
 					local spot = surfaceAt(posX, posZ)
-					if spot and (not best or spot.Y > best.Y) then
-						best = spot
+					if spot then
+						if not onlyExistingGems or hasExistingCrystalNear(spot) then
+							if not best or spot.Y > best.Y then
+								best = spot
+							end
+						end
 					end
 				end
 			end
@@ -5492,8 +5371,6 @@ do
 			return list
 		end
 
-		-- Replaced with plantPhase state machine in step()
-
 		local function findLoot(free, origin)
 			local now = os.clock()
 			local best, bestScore, bestDistance
@@ -5525,7 +5402,7 @@ do
 					score = luckPts
 				else
 					local value = crystalValue(inst)
-					if not meetsFilter(inst, value) then
+					if value < minMineValue or not meetsFilter(inst, value) then
 						return
 					end
 					score = value
@@ -5593,7 +5470,6 @@ do
 			lootLastHpChange = 0
 			lootHpMark = nil
 			table.clear(blacklistedLoot)
-			table.clear(blacklistedColumns)
 			table.clear(blacklistedColumns)
 			sellPhase = "idle"
 			sellReturnCFrame = nil
@@ -5781,7 +5657,10 @@ do
 					return luckPts >= minLuckPoints
 				end)
 			else
-				pickupStep()
+				pickupStep(function(inst)
+					local val = crystalValue(inst)
+					return val >= minMineValue
+				end)
 			end
 
 			if heldPick == nil or heldPick.Parent ~= LocalPlayer.Character then
@@ -5902,7 +5781,7 @@ do
 					columnY = spot.Y
 					target = spot
 
-					if columnDry >= COLUMN_DRY then
+					if columnDry >= COLUMN_DRY or (onlyExistingGems and not hasExistingCrystalNear(target)) then
 						blacklistedColumns[gridKey(target.X, target.Z)] = now + 20
 						target = nil
 						columnY = nil
@@ -6016,6 +5895,38 @@ do
 
 		MoneyBox:AddDivider()
 
+		MoneyBox:AddToggle("OnlyExistingGems", {
+			Text = "Only Mine Existing Gems",
+			Default = false,
+			Callback = function(value)
+				onlyExistingGems = value
+				target = nil
+				columnY = nil
+			end,
+		})
+
+		local function setMinMineValue(text)
+			local parsed = parseValue(text)
+			if not parsed then
+				return
+			end
+			minMineValue = math.max(parsed, 0)
+			loot = nil
+			target = nil
+			columnY = nil
+		end
+
+		MoneyBox:AddInput("MinMineValueInput", {
+			Text = "Min Value To Mine",
+			Default = "0",
+			Placeholder = "2m",
+			Numeric = false,
+			Finished = false,
+			Callback = setMinMineValue,
+		})
+
+		MoneyBox:AddDivider()
+
 		MoneyBox:AddToggle("AutoPlantLuckCrystals", {
 			Text = "Auto Plant Luck Crystals On Plot",
 			Default = false,
@@ -6025,10 +5936,13 @@ do
 		})
 
 		MoneyBox:AddToggle("MoneyAutoSell", {
-			Text = "Auto Sell At 50%",
+			Text = "Auto Sell At 80%",
 			Default = false,
 			Callback = function(value)
 				autoSell = value
+				if value then
+					SELL_MARK = 0.8
+				end
 			end,
 		})
 
@@ -6051,6 +5965,8 @@ do
 				StatusLabel:SetText(statusText)
 			end
 		end)
+	end
+
 
 		local function buyAllAvailableBombs()
 			local query = Remotes.BombShopQuery
