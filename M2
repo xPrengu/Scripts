@@ -4962,7 +4962,7 @@ end
 local Money = {}
 
 do
-local function install()
+	local function install()
 		local SCAN_SPOTS = {
 			CFrame.new(-12.7105675, 459.090942, 818.847412, 0.993408799, -0.00500036497, -0.11451605, 0.000644713698, 0.999275982, -0.0380407833, 0.114623353, 0.0377162211, 0.992692769),
 			CFrame.new(13.0506754, 318.450409, -488.078888, -0.99998939, 0.000884758658, -0.00452193478, -0.000498382491, 0.954864502, 0.297041386, 0.00458064489, 0.297040492, -0.954853892),
@@ -5112,15 +5112,13 @@ local function install()
 		local sellPhaseClock = 0
 		local plantPhase = "idle"
 		local plantPhaseClock = 0
-		local plantReturnCField
+		local plantReturnCFrame
 		local plantTools = {}
 		local plantIndex = 1
 		local plantPlotPos
 		local plantGroundPos
 		local lootBlocked = false
 		local statusText = "Idle"
-		local onlyExistingGems = false
-		local minMineValue = 0
 
 		local function toggleValue(name)
 			local store = Library and Library.Toggles
@@ -5207,32 +5205,6 @@ local function install()
 			return string.format("%d_%d", math.floor(x / 4), math.floor(z / 4))
 		end
 
-		local function hasExistingCrystalNear(pos)
-			local found = false
-			eachContainer(function(container)
-				for _, child in ipairs(container:GetChildren()) do
-					if child:IsA("BasePart") and isCrystal(child) and getAttr(child, "Collected") ~= true then
-						local val = crystalValue(child)
-						if val >= minMineValue and (child.Position - pos).Magnitude <= 35 then
-							found = true
-							return
-						end
-					elseif child:IsA("Model") then
-						for _, inner in ipairs(child:GetChildren()) do
-							if inner:IsA("BasePart") and isCrystal(inner) and getAttr(inner, "Collected") ~= true then
-								local val = crystalValue(inner)
-								if val >= minMineValue and (inner.Position - pos).Magnitude <= 35 then
-									found = true
-									return
-								end
-							end
-						end
-					end
-				end
-			end)
-			return found
-		end
-
 		local function highestColumn(origin, offsets)
 			local now = os.clock()
 			local best
@@ -5246,12 +5218,8 @@ local function install()
 				if not expire or now > expire then
 					blacklistedColumns[key] = nil
 					local spot = surfaceAt(posX, posZ)
-					if spot then
-						if not onlyExistingGems or hasExistingCrystalNear(spot) then
-							if not best or spot.Y > best.Y then
-								best = spot
-							end
-						end
+					if spot and (not best or spot.Y > best.Y) then
+						best = spot
 					end
 				end
 			end
@@ -5371,6 +5339,8 @@ local function install()
 			return list
 		end
 
+		-- Replaced with plantPhase state machine in step()
+
 		local function findLoot(free, origin)
 			local now = os.clock()
 			local best, bestScore, bestDistance
@@ -5402,7 +5372,7 @@ local function install()
 					score = luckPts
 				else
 					local value = crystalValue(inst)
-					if value < minMineValue or not meetsFilter(inst, value) then
+					if not meetsFilter(inst, value) then
 						return
 					end
 					score = value
@@ -5470,6 +5440,7 @@ local function install()
 			lootLastHpChange = 0
 			lootHpMark = nil
 			table.clear(blacklistedLoot)
+			table.clear(blacklistedColumns)
 			table.clear(blacklistedColumns)
 			sellPhase = "idle"
 			sellReturnCFrame = nil
@@ -5657,10 +5628,7 @@ local function install()
 					return luckPts >= minLuckPoints
 				end)
 			else
-				pickupStep(function(inst)
-					local val = crystalValue(inst)
-					return val >= minMineValue
-				end)
+				pickupStep()
 			end
 
 			if heldPick == nil or heldPick.Parent ~= LocalPlayer.Character then
@@ -5781,7 +5749,7 @@ local function install()
 					columnY = spot.Y
 					target = spot
 
-					if columnDry >= COLUMN_DRY or (onlyExistingGems and not hasExistingCrystalNear(target)) then
+					if columnDry >= COLUMN_DRY then
 						blacklistedColumns[gridKey(target.X, target.Z)] = now + 20
 						target = nil
 						columnY = nil
@@ -5895,38 +5863,6 @@ local function install()
 
 		MoneyBox:AddDivider()
 
-		MoneyBox:AddToggle("OnlyExistingGems", {
-			Text = "Only Mine Existing Gems",
-			Default = false,
-			Callback = function(value)
-				onlyExistingGems = value
-				target = nil
-				columnY = nil
-			end,
-		})
-
-		local function setMinMineValue(text)
-			local parsed = parseValue(text)
-			if not parsed then
-				return
-			end
-			minMineValue = math.max(parsed, 0)
-			loot = nil
-			target = nil
-			columnY = nil
-		end
-
-		MoneyBox:AddInput("MinMineValueInput", {
-			Text = "Min Value To Mine",
-			Default = "0",
-			Placeholder = "2m",
-			Numeric = false,
-			Finished = false,
-			Callback = setMinMineValue,
-		})
-
-		MoneyBox:AddDivider()
-
 		MoneyBox:AddToggle("AutoPlantLuckCrystals", {
 			Text = "Auto Plant Luck Crystals On Plot",
 			Default = false,
@@ -5936,13 +5872,10 @@ local function install()
 		})
 
 		MoneyBox:AddToggle("MoneyAutoSell", {
-			Text = "Auto Sell At 80%",
+			Text = "Auto Sell At 50%",
 			Default = false,
 			Callback = function(value)
 				autoSell = value
-				if value then
-					SELL_MARK = 0.8
-				end
 			end,
 		})
 
@@ -5965,8 +5898,6 @@ local function install()
 				StatusLabel:SetText(statusText)
 			end
 		end)
-	end
-
 
 		local function buyAllAvailableBombs()
 			local query = Remotes.BombShopQuery
